@@ -1,0 +1,435 @@
+=========================================================
+
+TESIS OLIVAR - ANALISIS FENOLOGICO RAPIDO POR REJILLA 250 m
+
+PROVINCIA DE JAEN
+
+Variables: PPT, TMAX, TMIN, PET, PDSI, VPD, WSPEED
+
+Respuestas: Qha_secano, Qha_riego
+
+=========================================================
+
+ENFOQUE RAPIDO:
+
+- NO genera una tabla mensual gigante.
+
+- Usa la rejilla como PUNTOS/CENTROIDES de 250 m.
+
+- Para cada variable y fase fenologica calcula un valor anual por celda.
+
+- Correlaciona la serie anual de cada celda con el rendimiento anual.
+
+- Exporta tablas, mapas y heatmaps.
+
+=========================================================
+
+=========================
+
+0. PAQUETES
+
+=========================
+
+required_pkgs <- c("terra", "sf", "dplyr", "tidyr", "stringr", "purrr","ggplot2", "readxl", "writexl", "forcats", "scales", "viridis")
+
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+
+suppressPackageStartupMessages({library(terra)library(sf)library(dplyr)library(tidyr)library(stringr)library(purrr)library(ggplot2)library(readxl)library(writexl)library(forcats)library(scales)library(viridis)})
+
+=========================
+
+1. RUTAS
+
+=========================
+
+project_dir <- "/Volumes/TRANSCEND/Pi Montaner"base_dir    <- file.path(project_dir, "VARIABLES")
+
+Carpetas climáticas
+
+dir_ppt    <- file.path(base_dir, "Precipitaciones 2000-2025")dir_tmax   <- file.path(base_dir, "TEMPERATURA MAXIMA")dir_tmin   <- file.path(base_dir, "TEMPERATURA MINIM")dir_pet    <- file.path(base_dir, "Terraclimate PET")dir_pdsi   <- file.path(base_dir, "Terraclimate PDSI")dir_vpd    <- file.path(base_dir, "VPD")dir_wspeed <- file.path(base_dir, "WSPEED")
+
+Rejilla y provincia
+
+Tu archivo de rejilla es de puntos, no polígonos. Eso es bueno para este método rápido.
+
+grid_250m_file <- file.path(project_dir, "Cuadricula 250.gpkg")jaen_zip       <- file.path(project_dir, "provincia_jaen.zip")
+
+Salidas
+
+out_dir <- file.path(base_dir, "RESULTADOS_MODELOS")if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+phen_out_dir <- file.path(out_dir, "ANALISIS_FENOLOGICO_RAPIDO_250m")if (!dir.exists(phen_out_dir)) dir.create(phen_out_dir, recursive = TRUE)
+
+map_out_dir <- file.path(phen_out_dir, "MAPAS_CORRELACION")if (!dir.exists(map_out_dir)) dir.create(map_out_dir, recursive = TRUE)
+
+terra_tmp <- file.path(base_dir, "terra_tmp")if (!dir.exists(terra_tmp)) dir.create(terra_tmp, recursive = TRUE)
+
+terraOptions(tempdir = terra_tmp, memfrac = 0.75, progress = 1)
+
+=========================
+
+2. COMPROBAR DISCO Y RUTAS
+
+=========================
+
+rutas_check <- data.frame(objeto = c("project_dir", "base_dir", "grid_250m_file", "jaen_zip", "PPT", "TMAX", "TMIN", "PET", "PDSI", "VPD", "WSPEED"),ruta = c(project_dir, base_dir, grid_250m_file, jaen_zip, dir_ppt, dir_tmax, dir_tmin, dir_pet, dir_pdsi, dir_vpd, dir_wspeed),existe = c(dir.exists(project_dir), dir.exists(base_dir), file.exists(grid_250m_file), file.exists(jaen_zip),dir.exists(dir_ppt), dir.exists(dir_tmax), dir.exists(dir_tmin), dir.exists(dir_pet),dir.exists(dir_pdsi), dir.exists(dir_vpd), dir.exists(dir_wspeed)))print(rutas_check)write.csv(rutas_check, file.path(phen_out_dir, "00_check_rutas.csv"), row.names = FALSE)
+
+if (any(!rutas_check$existe)) {stop("Hay rutas que no existen. Comprueba que el disco duro esté conectado y revisa 00_check_rutas.csv")}
+
+=========================
+
+3. FUNCIONES GENERALES
+
+=========================
+
+normalizar_texto <- function(x) {x <- as.character(x)x <- iconv(x, from = "", to = "ASCII//TRANSLIT")tolower(trimws(x))}
+
+limpiar_numerico <- function(x) {x <- as.character(x)x <- trimws(x)x <- gsub("\u00A0", "", x)x <- gsub(" ", "", x)x <- gsub("\.(?=\d{3}(\D|$))", "", x, perl = TRUE)x <- gsub(",", ".", x)x <- gsub("[^0-9\.-]", "", x)suppressWarnings(as.numeric(x))}
+
+get_year_from_name <- function(path) {hits <- stringr::str_extract_all(basename(path), "(19|20)\d{2}")[[1]]if (length(hits) == 0) return(NA_real_)as.numeric(hits[1])}
+
+fase_def <- list(Reposo      = c(1, 2),Brotacion   = c(3, 4),Floracion   = c(5),Cuajado     = c(6),Engorde     = c(7, 8, 9),Maduracion  = c(10, 11),Recoleccion = c(12))
+
+orden_fases <- names(fase_def)vars_clima <- c("PPT", "TMAX", "TMIN", "PET", "PDSI", "VPD", "WSPEED")
+
+=========================
+
+4. LECTURA ROBUSTA DE RENDIMIENTOS
+
+=========================
+
+leer_rendimientos_excel <- function(base_dir) {rend_candidates <- list.files(base_dir,pattern = "\.(xls|xlsx)$",full.names = TRUE,ignore.case = TRUE)
+
+rend_candidates <- rend_candidates[grepl("superficie|rend|produ|secano|riego|regadio|1950|2025|olivar", basename(rend_candidates), ignore.case = TRUE)]
+
+if (length(rend_candidates) == 0) {stop("No se encontró archivo XLS/XLSX de rendimientos en: ", base_dir)}
+
+rend_file <- rend_candidates[which.max(file.info(rend_candidates)$mtime)]message("Archivo de rendimientos usado: ", rend_file)
+
+sheets_xls <- readxl::excel_sheets(rend_file)
+
+detectar_tabla <- function(df) {if (is.null(df) || nrow(df) == 0 || ncol(df) < 3) return(NULL)df <- as.data.frame(df)df <- df[, colSums(!is.na(df)) > 0, drop = FALSE]if (ncol(df) < 3) return(NULL)
+
+nms <- normalizar_texto(names(df))
+col_year <- which(grepl("annee|anio|ano|año|year|ejercicio", nms))[1]
+col_sec  <- which(grepl("secano", nms))[1]
+col_rie  <- which(grepl("riego|regadio", nms))[1]
+
+if (is.na(col_year) || is.na(col_sec) || is.na(col_rie)) {
+  candidatos <- df[, 1:min(6, ncol(df)), drop = FALSE]
+  score_year <- sapply(candidatos, function(z) {
+    znum <- suppressWarnings(as.numeric(as.character(z)))
+    sum(!is.na(znum) & znum >= 1900 & znum <= 2100)
+  })
+  if (max(score_year, na.rm = TRUE) >= 10) {
+    col_year <- which.max(score_year)
+    resto <- setdiff(seq_len(ncol(candidatos)), col_year)
+    if (length(resto) >= 2) {
+      col_sec <- resto[1]
+      col_rie <- resto[2]
+    }
+  }
+}
+
+if (is.na(col_year) || is.na(col_sec) || is.na(col_rie)) return(NULL)
+
+out <- data.frame(
+  year = suppressWarnings(as.numeric(df[[col_year]])),
+  Qha_secano = limpiar_numerico(df[[col_sec]]),
+  Qha_riego  = limpiar_numerico(df[[col_rie]])
+) |>
+  filter(!is.na(year)) |>
+  filter(year >= 1900, year <= 2100) |>
+  arrange(year) |>
+  distinct(year, .keep_all = TRUE)
+
+if (nrow(out) < 10) return(NULL)
+if (sum(!is.na(out$Qha_secano)) == 0 && sum(!is.na(out$Qha_riego)) == 0) return(NULL)
+out
+
+}
+
+for (sh in sheets_xls) {for (sk in c(0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30)) {tmp <- tryCatch(readxl::read_excel(rend_file, sheet = sh, skip = sk), error = function(e) NULL)out <- detectar_tabla(tmp)if (!is.null(out)) {message("Hoja usada para rendimientos: ", sh, " | skip = ", sk)attr(out, "rend_file") <- rend_filereturn(out)}}}
+
+stop("No se pudo localizar una tabla válida de rendimientos.")}
+
+rend <- leer_rendimientos_excel(base_dir)write.csv(rend, file.path(phen_out_dir, "tabla_rendimientos_limpia.csv"), row.names = FALSE)
+
+=========================
+
+5. CARGAR JAEN Y REJILLA DE PUNTOS
+
+=========================
+
+grid_points <- sf::st_read(grid_250m_file, quiet = TRUE)grid_points <- sf::st_make_valid(grid_points)
+
+jaen <- sf::st_read(paste0("/vsizip/", jaen_zip), quiet = TRUE)jaen <- sf::st_make_valid(jaen)
+
+if (sf::st_crs(grid_points) != sf::st_crs(jaen)) {jaen <- sf::st_transform(jaen, sf::st_crs(grid_points))}
+
+jaen_union <- sf::st_union(jaen)jaen_sf <- sf::st_sf(geometry = jaen_union, crs = sf::st_crs(jaen))
+
+Quedarse solo con puntos dentro de Jaen. Mucho mas rapido que crear poligonos y exact_extract.
+
+grid_points <- grid_points[sf::st_intersects(grid_points, jaen_sf, sparse = FALSE)[, 1], ]grid_points$cell_id <- seq_len(nrow(grid_points))
+
+message("Celdas/puntos dentro de Jaen: ", nrow(grid_points))
+
+sf::st_write(grid_points, file.path(phen_out_dir, "rejilla_puntos_250m_jaen.gpkg"), delete_dsn = TRUE, quiet = TRUE)
+
+=========================
+
+6. LOCALIZAR ARCHIVOS
+
+=========================
+
+limpiar_ocultos <- function(x) {x <- x[!grepl("^\._|\.DS_Store", basename(x))]x[file.exists(x)]}
+
+find_files <- function(dir_path, keyword = NULL) {x <- list.files(dir_path,pattern = "\.(nc|tif|tiff)$",full.names = TRUE,recursive = TRUE,ignore.case = TRUE)x <- limpiar_ocultos(x)if (!is.null(keyword)) {y <- x[grepl(keyword, basename(x), ignore.case = TRUE)]if (length(y) > 0) x <- y}sort(x)}
+
+ppt_files    <- find_files(dir_ppt, "ppt")tmax_files   <- find_files(dir_tmax, "tmax")tmin_files   <- find_files(dir_tmin, "tmin")pet_files    <- find_files(dir_pet, "pet")pdsi_files   <- find_files(dir_pdsi, "pdsi")vpd_files    <- find_files(dir_vpd, "vpd")wspeed_files <- find_files(dir_wspeed, NULL)wspeed_files <- find_files(dir_wspeed, "wspeed")
+
+file_check <- data.frame(variable = vars_clima,n_files = c(length(ppt_files), length(tmax_files), length(tmin_files), length(pet_files), length(pdsi_files), length(vpd_files), length(wspeed_files)),primer_archivo = c(ifelse(length(ppt_files) > 0, basename(ppt_files[1]), NA),ifelse(length(tmax_files) > 0, basename(tmax_files[1]), NA),ifelse(length(tmin_files) > 0, basename(tmin_files[1]), NA),ifelse(length(pet_files) > 0, basename(pet_files[1]), NA),ifelse(length(pdsi_files) > 0, basename(pdsi_files[1]), NA),ifelse(length(vpd_files) > 0, basename(vpd_files[1]), NA),ifelse(length(wspeed_files) > 0, basename(wspeed_files[1]), NA)))
+
+print(file_check)write.csv(file_check, file.path(phen_out_dir, "00_control_archivos_variables.csv"), row.names = FALSE)
+
+if (any(file_check$n_files == 0)) {stop("Hay variables sin archivos. Revisa 00_control_archivos_variables.csv")}
+
+file_lists <- list(PPT = ppt_files,TMAX = tmax_files,TMIN = tmin_files,PET = pet_files,PDSI = pdsi_files,VPD = vpd_files,WSPEED = wspeed_files)
+
+=========================
+
+7. CORRECCION Y PLAUSIBILIDAD
+
+=========================
+
+corregir_raster_variable <- function(r, varname) {test_val <- tryCatch(as.numeric(terra::global(terra::mean(r, na.rm = TRUE), "mean", na.rm = TRUE)[1, 1]),error = function(e) NA_real_)
+
+Temperaturas TerraClimate: a veces vienen en decimas.
+
+if (varname %in% c("TMAX", "TMIN")) {if (!is.na(test_val) && test_val > -5 && test_val < 5) r <- r * 10}
+
+VPD y viento: control flexible de escala.
+
+if (varname == "VPD") {if (!is.na(test_val) && test_val > 20) r <- r / 100else if (!is.na(test_val) && test_val > 10) r <- r / 10}
+
+if (varname == "WSPEED") {if (!is.na(test_val) && test_val > 100) r <- r / 100else if (!is.na(test_val) && test_val > 30) r <- r / 10}
+
+Rangos mensuales plausibles.
+
+if (varname == "PPT")    r[r < 0 | r > 1000] <- NAif (varname == "TMAX")   r[r < -5 | r > 50] <- NAif (varname == "TMIN")   r[r < -20 | r > 35] <- NAif (varname == "PET")    r[r < 0 | r > 500] <- NAif (varname == "PDSI")   r[r < -10 | r > 10] <- NAif (varname == "VPD")    r[r < 0 | r > 10] <- NAif (varname == "WSPEED") r[r < 0 | r > 40] <- NA
+
+r}
+
+=========================
+
+8. EXTRAER VALORES POR FASE DE FORMA RAPIDA
+
+=========================
+
+Esta funcion NO crea una tabla mensual enorme.
+
+Para cada variable y fase devuelve una matriz:
+
+filas = celdas/puntos; columnas = años.
+
+extraer_matriz_fase <- function(files, varname, fase_name, months, points_sf, jaen_sf, agg = c("mean", "sum")) {agg <- match.arg(agg)years <- sapply(files, get_year_from_name)keep <- !is.na(years)files <- files[keep]years <- years[keep]
+
+ord <- order(years)files <- files[ord]years <- years[ord]
+
+mat <- matrix(NA_real_, nrow = nrow(points_sf), ncol = length(files))colnames(mat) <- as.character(years)
+
+for (i in seq_along(files)) {f <- files[i]y <- years[i]message("  ", varname, " | ", fase_name, " | ", y, " (", i, "/", length(files), ")")
+
+r <- tryCatch(terra::rast(f), error = function(e) NULL)
+if (is.null(r)) next
+
+r <- corregir_raster_variable(r, varname)
+
+if (terra::nlyr(r) < max(months)) {
+  warning("Archivo con menos capas de las esperadas: ", basename(f))
+  next
+}
+
+r_phase <- r[[months]]
+
+r_phase <- if (agg == "sum") {
+  app(r_phase, sum, na.rm = TRUE)
+} else {
+  app(r_phase, mean, na.rm = TRUE)
+}
+
+# Transformar puntos y provincia al CRS del raster.
+points_r <- points_sf
+jaen_r_sf <- jaen_sf
+if (sf::st_crs(points_r)$wkt != terra::crs(r_phase)) {
+  points_r <- sf::st_transform(points_r, terra::crs(r_phase))
+  jaen_r_sf <- sf::st_transform(jaen_r_sf, terra::crs(r_phase))
+}
+
+jaen_r <- terra::vect(jaen_r_sf)
+r_phase <- tryCatch({
+  terra::crop(r_phase, jaen_r) |> terra::mask(jaen_r)
+}, error = function(e) r_phase)
+
+vals <- tryCatch(
+  terra::extract(r_phase, terra::vect(points_r))[, 2],
+  error = function(e) {
+    warning("Error extrayendo ", varname, " ", fase_name, " ", y, ": ", e$message)
+    rep(NA_real_, nrow(points_sf))
+  }
+)
+
+mat[, i] <- vals
+gc()
+
+}
+
+list(matrix = mat, years = years)}
+
+cor_por_celda <- function(mat, years, rend_df, response) {common_years <- intersect(as.numeric(colnames(mat)), rend_df$year)if (length(common_years) < 5) {return(data.frame(cell_id = grid_points$cell_id, n = 0, r = NA_real_, p = NA_real_))}
+
+mat2 <- mat[, as.character(common_years), drop = FALSE]y <- rend_df[[response]][match(common_years, rend_df$year)]
+
+calc_one <- function(x) {ok <- complete.cases(x, y)n <- sum(ok)if (n < 5 || sd(x[ok]) == 0 || sd(y[ok]) == 0) {return(c(n = n, r = NA_real_, p = NA_real_))}ct <- suppressWarnings(cor.test(x[ok], y[ok], method = "pearson"))c(n = n, r = unname(ct$estimate), p = ct$p.value)}
+
+res <- t(apply(mat2, 1, calc_one))data.frame(cell_id = grid_points$cell_id,n = res[, "n"],r = res[, "r"],p = res[, "p"])}
+
+=========================
+
+9. BUCLE PRINCIPAL: CORRELACIONES POR VARIABLE Y FASE
+
+=========================
+
+agg_by_var <- c(PPT = "sum",TMAX = "mean",TMIN = "mean",PET = "sum",PDSI = "mean",VPD = "mean",WSPEED = "mean")
+
+cor_results <- list()summary_results <- list()
+
+for (varname in vars_clima) {message("\n==============================")message("VARIABLE: ", varname)message("==============================")
+
+files <- file_lists[[varname]]
+
+for (fase_name in orden_fases) {months <- fase_def[[fase_name]]agg <- agg_by_var[[varname]]
+
+obj <- extraer_matriz_fase(
+  files = files,
+  varname = varname,
+  fase_name = fase_name,
+  months = months,
+  points_sf = grid_points,
+  jaen_sf = jaen_sf,
+  agg = agg
+)
+
+mat <- obj$matrix
+years <- obj$years
+
+# Guardar una tabla ligera de media provincial por año/fase/variable.
+prov_year <- data.frame(
+  year = as.numeric(colnames(mat)),
+  variable = varname,
+  fase = fase_name,
+  valor_medio_provincial = colMeans(mat, na.rm = TRUE),
+  valor_sd_espacial = apply(mat, 2, sd, na.rm = TRUE)
+)
+summary_results[[paste(varname, fase_name, sep = "_")]] <- prov_year
+
+for (resp in c("Qha_secano", "Qha_riego")) {
+  cor_df <- cor_por_celda(mat, years, rend, resp) |>
+    mutate(
+      respuesta = resp,
+      variable = varname,
+      fase = fase_name,
+      significacion = case_when(
+        is.na(p) ~ NA_character_,
+        p < 0.001 ~ "***",
+        p < 0.01 ~ "**",
+        p < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  cor_results[[paste(resp, varname, fase_name, sep = "_")]] <- cor_df
+}
+
+}}
+
+cor_grid_total <- bind_rows(cor_results)fase_anual_provincial <- bind_rows(summary_results)
+
+write.csv(cor_grid_total, file.path(phen_out_dir, "correlaciones_grid_fase_variable.csv"), row.names = FALSE)write.csv(fase_anual_provincial, file.path(phen_out_dir, "fase_anual_provincial_variables.csv"), row.names = FALSE)
+
+=========================
+
+10. RESUMEN PROVINCIAL DE CORRELACIONES
+
+=========================
+
+cor_resumen_provincial <- cor_grid_total |>group_by(respuesta, fase, variable) |>summarise(n_celdas = sum(!is.na(r)),r_media = mean(r, na.rm = TRUE),r_mediana = median(r, na.rm = TRUE),r_sd = sd(r, na.rm = TRUE),prop_p_005 = mean(p < 0.05, na.rm = TRUE),.groups = "drop") |>mutate(fase = factor(fase, levels = orden_fases),variable = factor(variable, levels = vars_clima))
+
+write.csv(cor_resumen_provincial, file.path(phen_out_dir, "resumen_provincial_correlaciones_fenologia.csv"), row.names = FALSE)
+
+=========================
+
+11. HEATMAPS FENOLOGICOS
+
+=========================
+
+plot_heatmap_feno <- function(df, response_name, file_out) {d <- df |>filter(respuesta == response_name) |>mutate(fase = factor(fase, levels = orden_fases),variable = factor(variable, levels = rev(vars_clima)),etiqueta = sprintf("%.2f", r_media))
+
+p <- ggplot(d, aes(x = fase, y = variable, fill = r_media)) +geom_tile(color = "white", linewidth = 0.6) +geom_text(aes(label = etiqueta), size = 3.3, fontface = "bold") +scale_fill_gradient2(low = "#B2182B",mid = "white",high = "#2166AC",midpoint = 0,limits = c(-1, 1),na.value = "grey90") +labs(title = paste("Sensibilidad fenológica del rendimiento -", response_name),subtitle = "Correlación media espacial por celda de 250 m",x = "Fase fenológica",y = "Variable climática",fill = "r media") +theme_minimal(base_size = 12) +theme(plot.title = element_text(face = "bold", hjust = 0.5),plot.subtitle = element_text(hjust = 0.5),axis.text.x = element_text(angle = 35, hjust = 1),panel.grid = element_blank())
+
+ggsave(file_out, p, width = 10, height = 6.5, dpi = 320)}
+
+plot_heatmap_feno(cor_resumen_provincial, "Qha_secano", file.path(phen_out_dir, "heatmap_fenologia_correlacion_secano.png"))plot_heatmap_feno(cor_resumen_provincial, "Qha_riego",  file.path(phen_out_dir, "heatmap_fenologia_correlacion_regadio.png"))
+
+=========================
+
+12. CICLO ANUAL MEDIO PROVINCIAL
+
+=========================
+
+Esta parte usa las fases como aproximacion fenologica ya calculada.
+
+p_ciclo_fases <- fase_anual_provincial |>group_by(variable, fase) |>summarise(media = mean(valor_medio_provincial, na.rm = TRUE),sd = sd(valor_medio_provincial, na.rm = TRUE),.groups = "drop") |>mutate(fase = factor(fase, levels = orden_fases)) |>ggplot(aes(x = fase, y = media, group = variable)) +geom_col(fill = "#4C78A8", alpha = 0.85) +geom_errorbar(aes(ymin = media - sd, ymax = media + sd), width = 0.18) +facet_wrap(~variable, scales = "free_y", ncol = 2) +labs(title = "Ciclo fenológico medio de las variables climáticas en Jaén",subtitle = "Media provincial por fase fenológica; barras = ±1 desviación estándar interanual",x = "Fase fenológica",y = "Valor medio") +theme_minimal(base_size = 12) +theme(plot.title = element_text(face = "bold", hjust = 0.5),plot.subtitle = element_text(hjust = 0.5),axis.text.x = element_text(angle = 35, hjust = 1),panel.grid.minor = element_blank())
+
+ggsave(file.path(phen_out_dir, "ciclo_fenologico_medio_variables_jaen.png"), p_ciclo_fases, width = 11, height = 8, dpi = 320)
+
+=========================
+
+13. EVOLUCION TEMPORAL POR FASE
+
+=========================
+
+p_fase_tiempo <- fase_anual_provincial |>mutate(fase = factor(fase, levels = orden_fases)) |>ggplot(aes(x = year, y = valor_medio_provincial)) +geom_line(color = "#1F4E79", linewidth = 0.45, alpha = 0.8) +geom_smooth(method = "loess", se = FALSE, color = "#B03A2E", linewidth = 0.75) +facet_grid(variable ~ fase, scales = "free_y") +labs(title = "Evolución temporal de variables climáticas por fase fenológica",subtitle = "Valores medios provinciales extraídos en la rejilla de 250 m",x = "Año",y = "Valor medio provincial") +theme_minimal(base_size = 9.5) +theme(plot.title = element_text(face = "bold", hjust = 0.5),plot.subtitle = element_text(hjust = 0.5),axis.text.x = element_text(angle = 45, hjust = 1),panel.grid.minor = element_blank())
+
+ggsave(file.path(phen_out_dir, "evolucion_temporal_variables_por_fase.png"), p_fase_tiempo, width = 16, height = 12, dpi = 320)
+
+=========================
+
+14. MAPAS DE CORRELACION CLAVE
+
+=========================
+
+crear_mapa_correlacion <- function(cor_df, points_sf, response_name, variable_name, fase_name, file_out) {d <- cor_df |>filter(respuesta == response_name, variable == variable_name, fase == fase_name) |>select(cell_id, r, p)
+
+mapa <- points_sf |>left_join(d, by = "cell_id")
+
+p <- ggplot(mapa) +geom_sf(aes(color = r), size = 0.08, alpha = 0.9) +geom_sf(data = jaen_sf, fill = NA, color = "black", linewidth = 0.25) +scale_color_gradient2(low = "#B2182B",mid = "white",high = "#2166AC",midpoint = 0,limits = c(-1, 1),na.value = "grey85") +labs(title = paste(response_name, "-", variable_name, "-", fase_name),subtitle = "Correlación de Pearson por celda/centroide de 250 m",color = "r") +theme_minimal(base_size = 11) +theme(plot.title = element_text(face = "bold", hjust = 0.5),plot.subtitle = element_text(hjust = 0.5),axis.text = element_blank(),axis.title = element_blank(),panel.grid = element_blank())
+
+ggsave(file_out, p, width = 8, height = 7, dpi = 320)}
+
+mapas_clave <- expand.grid(respuesta = c("Qha_secano", "Qha_riego"),variable = c("PPT", "PET", "PDSI", "VPD", "TMAX", "WSPEED"),fase = c("Brotacion", "Floracion", "Cuajado", "Engorde", "Maduracion"),stringsAsFactors = FALSE)
+
+for (i in seq_len(nrow(mapas_clave))) {crear_mapa_correlacion(cor_grid_total,grid_points,mapas_clave$respuesta[i],mapas_clave$variable[i],mapas_clave$fase[i],file.path(map_out_dir, paste0("mapa_cor_", mapas_clave$respuesta[i], "", mapas_clave$variable[i], "", mapas_clave$fase[i], ".png")))}
+
+=========================
+
+15. EXPORTACION FINAL
+
+=========================
+
+write_xlsx(list(rendimientos = rend,control_archivos = file_check,resumen_correlaciones = cor_resumen_provincial,fase_anual_provincial = fase_anual_provincial),path = file.path(phen_out_dir, "resumen_analisis_fenologico_rapido_250m.xlsx"))
+
+save(cor_grid_total,cor_resumen_provincial,fase_anual_provincial,grid_points,file = file.path(phen_out_dir, "objetos_analisis_fenologico_rapido_250m.RData"))
+
+cat("\nANALISIS FENOLOGICO RAPIDO TERMINADO CORRECTAMENTE\n")cat("Resultados guardados en:\n", phen_out_dir, "\n")
