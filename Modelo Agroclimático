@@ -1,0 +1,617 @@
+
+# MODELO AGROCLIMÁTICO JAÉN - METODOLOGÍA TIPO ARFAOUI
+# Clima TerraClimate + NDVI/EVI 250 m + Rendimientos
+# Stepwise + LOOCV
+
+
+rm(list = ls())
+gc()
+
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(MASS)
+
+
+# 1. RUTAS
+
+
+disk_dir <- "/Volumes/TRANSCEND"
+pi_dir   <- file.path(disk_dir, "Pi Montaner")
+var_dir  <- file.path(pi_dir, "VARIABLES")
+
+out_dir <- file.path(disk_dir, "MODELO_ARFAOUI_MODIS_250M_JAEN_CORREGIDO")
+tmp_dir <- file.path(disk_dir, "terra_tmp_modelo_modis")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+terraOptions(
+  tempdir = tmp_dir,
+  memfrac = 0.5,
+  progress = 1
+)
+
+excel_rend <- file.path(pi_dir, "Superficie_rendements_Pce_Jaen_1950-2025-2.xlsx")
+shp_jaen   <- file.path(pi_dir, "provincia_jaen copia", "provincia_jaen.shp")
+mask_dir   <- file.path(disk_dir, "CAPAS OLIVARES")
+
+dir_ppt    <- file.path(var_dir, "Precipitaciones 2000-2025")
+dir_tmax   <- file.path(var_dir, "TEMPERATURA MAXIMA")
+dir_tmin   <- file.path(var_dir, "TEMPERATURA MINIM")
+dir_pet    <- file.path(var_dir, "Terraclimate PET")
+dir_pdsi   <- file.path(var_dir, "Terraclimate PDSI")
+dir_vpd    <- file.path(var_dir, "VPD")
+dir_wspeed <- file.path(var_dir, "WSPEED")
+
+dir_ndvi <- file.path(var_dir, "NDVI COMPLETO")
+dir_evi  <- file.path(var_dir, "EVIs")
+
+if (!dir.exists(dir_evi)) {
+  dir_evi <- file.path(pi_dir, "EVI 16 DAYS")
+}
+
+YEARS_MASKS <- c(1999, 2003, 2007, 2011, 2018, 2020, 2023, 2026)
+
+#Aquí no entiendo por qué he escogido que las máscaras que se van a analizar son hasta 2026. Pero sin embargo se ha analizado
+al correr el código hasta 2023. (mejorar esta parte)
+
+# 2. FUNCIONES
+
+
+limpiar_num <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\u00A0| ", "", x)
+  x <- gsub("\\.(?=\\d{3}(\\D|$))", "", x, perl = TRUE)
+  x <- gsub(",", ".", x)
+  x <- gsub("[^0-9\\.-]", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+get_year <- function(x) {
+  suppressWarnings(as.numeric(str_extract(basename(x), "(19|20)\\d{2}")))
+}
+
+get_date_modis <- function(path) {
+  x <- basename(path)
+  hit <- str_extract(x, "A(19|20)\\d{2}\\d{3}")
+  if (!is.na(hit)) {
+    year <- as.numeric(substr(hit, 2, 5))
+    doy  <- as.numeric(substr(hit, 6, 8))
+    return(as.Date(doy - 1, origin = paste0(year, "-01-01")))
+  }
+  d <- str_extract(x, "(19|20)\\d{2}[-_]\\d{2}[-_]\\d{2}")
+  if (!is.na(d)) return(as.Date(gsub("_", "-", d)))
+  y <- get_year(path)
+  if (is.na(y)) return(as.Date(NA))
+  as.Date(paste0(y, "-01-01"))
+}
+
+find_files <- function(path, key = NULL) {
+  if (!dir.exists(path)) {
+    warning("No existe la carpeta: ", path)
+    return(character(0))
+  }
+  x <- list.files(
+    path,
+    pattern = "\\.(tif|tiff|nc|gpkg)$",
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+  x <- x[!grepl("^\\._|\\.DS_Store|-wal|-shm", basename(x))]
+  if (!is.null(key)) {
+    y <- x[str_detect(tolower(basename(x)), tolower(key))]
+    if (length(y) > 0) x <- y
+  }
+  sort(x)
+}
+
+fase_from_month <- function(m) {
+  case_when(
+    m %in% c(1, 2) ~ "Reposo",
+    m %in% c(3, 4) ~ "Brotacion",
+    m %in% c(5, 6) ~ "Floracion_Cuajado",
+    m %in% c(7, 8, 9) ~ "Engorde",
+    m %in% c(10, 11) ~ "Maduracion",
+    m == 12 ~ "Recoleccion",
+    TRUE ~ NA_character_
+  )
+}
+
+media_jaen <- function(r, jaen_sf) {
+  jaen_v <- vect(st_transform(jaen_sf, crs(r)))
+  r2 <- crop(r, jaen_v)
+  r3 <- mask(r2, jaen_v)
+  as.numeric(global(r3, "mean", na.rm = TRUE)[1, 1])
+}
+
+corregir_valor <- function(valor, var) {
+  if (is.na(valor)) return(NA_real_)
+  
+  if (var %in% c("TMAX", "TMIN") && abs(valor) > 80) valor <- valor / 10
+  if (var %in% c("NDVI", "EVI") && abs(valor) > 2) valor <- valor / 10000
+  if (var == "VPD" && valor > 20) valor <- valor / 100
+  if (var == "VPD" && valor > 10 && valor <= 20) valor <- valor / 10
+  if (var == "WSPEED" && valor > 100) valor <- valor / 100
+  if (var == "WSPEED" && valor > 30 && valor <= 100) valor <- valor / 10
+  
+  if (var == "PPT"    && (valor < 0 | valor > 1500)) return(NA_real_)
+  if (var == "TMAX"   && (valor < 0 | valor > 50)) return(NA_real_)
+  if (var == "TMIN"   && (valor < -15 | valor > 35)) return(NA_real_)
+  if (var == "PET"    && (valor < 0 | valor > 500)) return(NA_real_)
+  if (var == "PDSI"   && (valor < -10 | valor > 10)) return(NA_real_)
+  if (var == "VPD"    && (valor < 0 | valor > 10)) return(NA_real_)
+  if (var == "WSPEED" && (valor < 0 | valor > 40)) return(NA_real_)
+  if (var == "NDVI"   && (valor < -1 | valor > 1)) return(NA_real_)
+  if (var == "EVI"    && (valor < -1 | valor > 1)) return(NA_real_)
+  
+  valor
+}
+
+
+# 3. CARGAR JAÉN Y RENDIMIENTOS
+
+
+jaen <- st_read(shp_jaen, quiet = TRUE)
+jaen <- st_make_valid(jaen)
+
+rend <- read_excel(excel_rend, sheet = "rendements OK") |>
+  rename(
+    year = 1,
+    Qha_secano = `Q/ha secano`,
+    Qha_riego  = `Q/ha riego`
+  ) |>
+  mutate(
+    year = as.numeric(str_extract(as.character(year), "(19|20)\\d{2}")),
+    Qha_secano = limpiar_num(Qha_secano),
+    Qha_riego  = limpiar_num(Qha_riego)
+  ) |>
+  filter(!is.na(year), year >= 2000, year <= 2025) |>
+  arrange(year)
+
+write.csv(rend, file.path(out_dir, "01_rendimientos_2000_2025.csv"), row.names = FALSE)
+
+# 4. CLIMA TERRACLIMATE
+
+
+extraer_clima_mensual <- function(files, varname) {
+  out <- list()
+  k <- 1
+  
+  for (f in files) {
+    year <- get_year(f)
+    if (is.na(year) || year < 1999 || year > 2025) next
+    
+    message("CLIMA ", varname, " | ", year)
+    
+    r <- tryCatch(rast(f), error = function(e) NULL)
+    if (is.null(r) || nlyr(r) < 12) next
+    
+    for (m in 1:12) {
+      val <- tryCatch(media_jaen(r[[m]], jaen), error = function(e) NA_real_)
+      val <- corregir_valor(val, varname)
+      
+      out[[k]] <- data.frame(
+        year = year,
+        month = m,
+        variable = varname,
+        value = val
+      )
+      k <- k + 1
+    }
+    
+    rm(r)
+    gc()
+  }
+  
+  bind_rows(out)
+}
+
+files_clima <- list(
+  PPT    = find_files(dir_ppt, "ppt"),
+  TMAX   = find_files(dir_tmax, "tmax"),
+  TMIN   = find_files(dir_tmin, "tmin"),
+  PET    = find_files(dir_pet, "pet"),
+  PDSI   = find_files(dir_pdsi, "pdsi"),
+  VPD    = find_files(dir_vpd, "vpd"),
+  WSPEED = find_files(dir_wspeed, NULL)
+)
+
+control_clima <- data.frame(
+  variable = names(files_clima),
+  n_files = sapply(files_clima, length)
+)
+
+write.csv(control_clima, file.path(out_dir, "00_control_archivos_clima.csv"), row.names = FALSE)
+print(control_clima)
+
+clima_mensual <- bind_rows(lapply(names(files_clima), function(v) {
+  extraer_clima_mensual(files_clima[[v]], v)
+}))
+
+write.csv(clima_mensual, file.path(out_dir, "02_clima_mensual_terraclimate_jaen.csv"), row.names = FALSE)
+
+
+# 5. MÁSCARAS DE OLIVAR PARA NDVI/EVI
+
+#Hay que decir aquí que finalmente se va a utilizar la máscara de 250m de NDVI y EVI para desescalar el resto de capas
+de la superficie de olivares. No hace falta utilizar la malla de 250m creada por mí. 
+
+mask_files <- find_files(mask_dir, NULL)
+
+tabla_masks <- data.frame(
+  archivo = basename(mask_files),
+  ruta = mask_files,
+  year_mask = get_year(mask_files)
+) |>
+  filter(!is.na(year_mask), year_mask %in% YEARS_MASKS) |>
+  mutate(
+    prioridad = case_when(
+      year_mask == 2026 & archivo == "CAPA OLIVARES 2026.gpkg" ~ 1,
+      year_mask == 2026 & archivo == "OLIVARES2026.gpkg" ~ 2,
+      TRUE ~ 3
+    )
+  ) |>
+  arrange(year_mask, prioridad) |>
+  group_by(year_mask) |>
+  slice(1) |>
+  ungroup() |>
+  dplyr::select(archivo, ruta, year_mask)
+
+write.csv(tabla_masks, file.path(out_dir, "00_mascaras_modis_250m.csv"), row.names = FALSE)
+print(tabla_masks)
+
+elegir_mascara <- function(year) {
+  disponibles <- tabla_masks |> filter(year_mask <= year)
+  if (nrow(disponibles) == 0) return(NA_character_)
+  disponibles$ruta[which.max(disponibles$year_mask)]
+}
+
+media_modis_olivar <- function(r, mask_path) {
+  jaen_v <- vect(st_transform(jaen, crs(r)))
+  r <- crop(r, jaen_v)
+  r <- mask(r, jaen_v)
+  
+  if (grepl("\\.gpkg$", mask_path, ignore.case = TRUE)) {
+    shp <- st_read(mask_path, quiet = TRUE)
+    shp <- st_make_valid(shp)
+    shp <- st_transform(shp, st_crs(jaen))
+    shp <- suppressWarnings(st_intersection(shp, jaen))
+    
+    shp_v <- vect(st_transform(shp, crs(r)))
+    r2 <- crop(r, shp_v)
+    r3 <- mask(r2, shp_v)
+    
+    return(as.numeric(global(r3, "mean", na.rm = TRUE)[1, 1]))
+  }
+  
+  if (grepl("\\.tif$|\\.tiff$", mask_path, ignore.case = TRUE)) {
+    m <- rast(mask_path)
+    
+    if (!same.crs(m, r)) {
+      m <- project(m, r, method = "near")
+    }
+    
+    if (!compareGeom(r, m, stopOnError = FALSE)) {
+      m <- resample(m, r, method = "near")
+    }
+    
+    m_bin <- m > 0
+    r_mask <- mask(r, m_bin, maskvalues = 0)
+    
+    return(as.numeric(global(r_mask, "mean", na.rm = TRUE)[1, 1]))
+  }
+  
+  NA_real_
+}
+
+
+# 6. NDVI/EVI A 250 m SOBRE OLIVAR
+
+
+extraer_vi_16dias <- function(files, varname) {
+  out <- list()
+  k <- 1
+  
+  for (f in files) {
+    fecha <- get_date_modis(f)
+    if (is.na(fecha)) next
+    
+    year <- as.numeric(format(fecha, "%Y"))
+    month <- as.numeric(format(fecha, "%m"))
+    fase <- fase_from_month(month)
+    
+    if (year < 2000 || year > 2025) next
+    
+    mask_path <- elegir_mascara(year)
+    if (is.na(mask_path)) next
+    
+    message("VI ", varname, " | ", fecha, " | ", basename(mask_path))
+    
+    r <- tryCatch(rast(f), error = function(e) NULL)
+    if (is.null(r)) next
+    
+    r <- r[[1]]
+    
+    val <- tryCatch(media_modis_olivar(r, mask_path), error = function(e) NA_real_)
+    val <- corregir_valor(val, varname)
+    
+    out[[k]] <- data.frame(
+      year = year,
+      month = month,
+      fase = fase,
+      variable = varname,
+      value = val,
+      mascara = basename(mask_path)
+    )
+    
+    k <- k + 1
+    
+    rm(r)
+    gc()
+  }
+  
+  bind_rows(out)
+}
+
+files_vi <- list(
+  NDVI = find_files(dir_ndvi, "ndvi"),
+  EVI  = find_files(dir_evi, "evi")
+)
+
+control_vi <- data.frame(
+  variable = names(files_vi),
+  n_files = sapply(files_vi, length)
+)
+
+write.csv(control_vi, file.path(out_dir, "00_control_archivos_ndvi_evi.csv"), row.names = FALSE)
+print(control_vi)
+
+vi_16dias <- bind_rows(lapply(names(files_vi), function(v) {
+  extraer_vi_16dias(files_vi[[v]], v)
+})) 
+
+vi_mensual <- vi_16dias |>
+  group_by(year, month, variable) |>
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(value = ifelse(is.nan(value), NA, value))
+
+write.csv(vi_16dias, file.path(out_dir, "03_ndvi_evi_16dias_250m_olivar.csv"), row.names = FALSE)
+write.csv(vi_mensual, file.path(out_dir, "04_ndvi_evi_mensual_250m_olivar.csv"), row.names = FALSE)
+
+
+# 7. UNIR CLIMA + NDVI/EVI
+
+datos_mensuales <- bind_rows(
+  clima_mensual,
+  vi_mensual
+)
+
+
+# 8. CONSTRUIR VARIABLES AGREGADAS
+
+
+getv <- function(df, var, months, fun = "mean") {
+  vals <- df |> filter(variable == var, month %in% months) |> pull(value)
+  if (length(vals) == 0 || all(is.na(vals))) return(NA_real_)
+  if (fun == "sum") sum(vals, na.rm = TRUE) else mean(vals, na.rm = TRUE)
+}
+
+crear_vars_year <- function(y) {
+  actual <- datos_mensuales |> filter(year == y)
+  prev   <- datos_mensuales |> filter(year == y - 1)
+  
+  vars <- c("PPT", "TMAX", "TMIN", "PET", "PDSI", "VPD", "WSPEED", "NDVI", "EVI")
+  sum_vars <- c("PPT", "PET")
+  
+  fases <- list(
+    Reposo = c(1, 2),
+    Brotacion = c(3, 4),
+    Floracion_Cuajado = c(5, 6),
+    Engorde = c(7, 8, 9),
+    Maduracion = c(10, 11),
+    Recoleccion = c(12)
+  )
+  
+  out <- data.frame(year = y)
+  
+  for (v in vars) {
+    fun <- ifelse(v %in% sum_vars, "sum", "mean")
+    
+    for (fase in names(fases)) {
+      out[[paste(v, fase, sep = "_")]] <- getv(actual, v, fases[[fase]], fun)
+    }
+    
+    out[[paste0(v, "_annual")]] <- getv(actual, v, 1:12, fun)
+    out[[paste0(v, "_MAM")]] <- getv(actual, v, 3:5, fun)
+    out[[paste0(v, "_JJA")]] <- getv(actual, v, 6:8, fun)
+    out[[paste0(v, "_SON")]] <- getv(actual, v, 9:11, fun)
+    
+    out[[paste0(v, "_hydro")]] <- if (fun == "sum") {
+      sum(getv(prev, v, 9:12, fun), getv(actual, v, 1:8, fun), na.rm = TRUE)
+    } else {
+      mean(c(getv(prev, v, 9:12, fun), getv(actual, v, 1:8, fun)), na.rm = TRUE)
+    }
+    
+    out[[paste0(v, "_physio")]] <- if (fun == "sum") {
+      sum(getv(prev, v, 9:12, fun), getv(actual, v, 1:12, fun), na.rm = TRUE)
+    } else {
+      mean(c(getv(prev, v, 9:12, fun), getv(actual, v, 1:12, fun)), na.rm = TRUE)
+    }
+  }
+  
+  out
+}
+
+vars_modelo <- bind_rows(lapply(2000:2025, crear_vars_year))
+
+datos_modelo <- rend |>
+  left_join(vars_modelo, by = "year") |>
+  arrange(year)
+
+write.csv(datos_modelo, file.path(out_dir, "05_matriz_modelo_clima_modis.csv"), row.names = FALSE)
+
+
+# 9. STEPWISE + LOOCV
+
+
+loocv_lm <- function(formula, data) {
+  n <- nrow(data)
+  pred <- rep(NA_real_, n)
+  
+  for (i in seq_len(n)) {
+    train <- data[-i, , drop = FALSE]
+    test  <- data[i, , drop = FALSE]
+    mod <- tryCatch(lm(formula, data = train), error = function(e) NULL)
+    if (!is.null(mod)) {
+      pred[i] <- tryCatch(predict(mod, newdata = test), error = function(e) NA_real_)
+    }
+  }
+  
+  obs <- model.response(model.frame(formula, data))
+  
+  data.frame(
+    RMSE_LOOCV = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE_LOOCV = mean(abs(obs - pred), na.rm = TRUE)
+  )
+}
+
+hacer_stepwise <- function(df, respuesta, top_n = 12) {
+  preds <- setdiff(names(df), c("year", "Qha_secano", "Qha_riego"))
+  
+  cors <- data.frame(
+    predictor = preds,
+    r = sapply(preds, function(p) {
+      if (sum(complete.cases(df[[respuesta]], df[[p]])) < 10) return(NA_real_)
+      cor(df[[respuesta]], df[[p]], use = "complete.obs")
+    })
+  ) |>
+    filter(!is.na(r)) |>
+    mutate(abs_r = abs(r)) |>
+    arrange(desc(abs_r)) |>
+    slice_head(n = top_n)
+  
+  vars <- cors$predictor
+  
+  df_mod <- df |>
+    dplyr::select(all_of(c("year", respuesta, vars))) |>
+    drop_na()
+  
+  mod0 <- lm(as.formula(paste(respuesta, "~ 1")), data = df_mod)
+  mod_full <- lm(as.formula(paste(respuesta, "~", paste(vars, collapse = " + "))), data = df_mod)
+  
+  mod_step <- stepAIC(
+    mod0,
+    scope = list(lower = mod0, upper = mod_full),
+    direction = "both",
+    trace = FALSE
+  )
+  
+  obs <- model.response(model.frame(mod_step))
+  pred <- predict(mod_step)
+  fstat <- summary(mod_step)$fstatistic
+  loocv <- loocv_lm(formula(mod_step), model.frame(mod_step))
+  
+  metricas <- data.frame(
+    modelo = respuesta,
+    R2 = summary(mod_step)$r.squared,
+    R2_ajustado = summary(mod_step)$adj.r.squared,
+    RMSE = sqrt(mean((obs - pred)^2, na.rm = TRUE)),
+    MAE = mean(abs(obs - pred), na.rm = TRUE),
+    AIC = AIC(mod_step),
+    F = unname(fstat[1]),
+    p_value = pf(fstat[1], fstat[2], fstat[3], lower.tail = FALSE),
+    RMSE_LOOCV = loocv$RMSE_LOOCV,
+    MAE_LOOCV = loocv$MAE_LOOCV,
+    formula = paste(deparse(formula(mod_step)), collapse = " ")
+  )
+  
+  list(modelo = mod_step, datos = df_mod, preseleccion = cors, metricas = metricas)
+}
+
+step_secano <- hacer_stepwise(datos_modelo, "Qha_secano", top_n = 12)
+step_riego  <- hacer_stepwise(datos_modelo, "Qha_riego", top_n = 12)
+
+metricas <- bind_rows(step_secano$metricas, step_riego$metricas) |>
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+write.csv(metricas, file.path(out_dir, "06_metricas_stepwise_LOOCV.csv"), row.names = FALSE)
+write.csv(step_secano$preseleccion, file.path(out_dir, "06_preseleccion_secano.csv"), row.names = FALSE)
+write.csv(step_riego$preseleccion, file.path(out_dir, "06_preseleccion_regadio.csv"), row.names = FALSE)
+
+writeLines(capture.output(summary(step_secano$modelo)), file.path(out_dir, "summary_stepwise_secano.txt"))
+writeLines(capture.output(summary(step_riego$modelo)), file.path(out_dir, "summary_stepwise_regadio.txt"))
+
+
+# 10. GRÁFICOS - Estos gráficos se quedan cortos y sería interesante mejorarlos cuando el Stepwise esté hecho. 
+
+
+pred <- bind_rows(
+  data.frame(
+    year = step_secano$datos$year,
+    observado = step_secano$datos$Qha_secano,
+    predicho = predict(step_secano$modelo),
+    sistema = "Secano"
+  ),
+  data.frame(
+    year = step_riego$datos$year,
+    observado = step_riego$datos$Qha_riego,
+    predicho = predict(step_riego$modelo),
+    sistema = "Regadío"
+  )
+)
+
+p1 <- ggplot(pred, aes(observado, predicho)) +
+  geom_point(size = 2.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ sistema, scales = "free") +
+  labs(
+    title = "Rendimientos observados y predichos",
+    subtitle = "Regresión múltiple stepwise con validación LOOCV",
+    x = "Rendimiento observado (Q/ha)",
+    y = "Rendimiento predicho (Q/ha)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave(file.path(out_dir, "07_observado_vs_predicho.png"), p1, width = 10, height = 6, dpi = 300)
+
+p2 <- ggplot(pred, aes(year)) +
+  geom_line(aes(y = observado), linewidth = 1) +
+  geom_line(aes(y = predicho), linewidth = 1, linetype = "dashed") +
+  facet_wrap(~ sistema, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Evolución de rendimientos observados y predichos",
+    subtitle = "Línea continua: observado; línea discontinua: predicho",
+    x = "Año",
+    y = "Rendimiento (Q/ha)"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave(file.path(out_dir, "08_evolucion_observado_predicho.png"), p2, width = 11, height = 8, dpi = 300)
+
+write_xlsx(
+  list(
+    control_clima = control_clima,
+    control_ndvi_evi = control_vi,
+    mascaras_modis = tabla_masks,
+    clima_mensual = clima_mensual,
+    ndvi_evi_16dias = vi_16dias,
+    ndvi_evi_mensual = vi_mensual,
+    variables_modelo = vars_modelo,
+    matriz_modelo = datos_modelo,
+    metricas = metricas,
+    preseleccion_secano = step_secano$preseleccion,
+    preseleccion_regadio = step_riego$preseleccion,
+    predicciones = pred
+  ),
+  path = file.path(out_dir, "resumen_modelo_arfaoui_modis_250m.xlsx")
+)
+
+cat("\nMODELO TERMINADO CORRECTAMENTE\n")
+cat("Resultados en:\n", out_dir, "\n")
